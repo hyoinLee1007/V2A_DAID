@@ -1,0 +1,33 @@
+1) Manipulation 구간 파악
+=> frames 24:75	
+
+2) 이미 있는 mesh정점 13311개의 신뢰도 값을 이웃끼리 섞음 
+=> sigma-smooth 0.012 (정점의 H값을 smoothing)
+
+3) 오라클이 z*를 "손 끝-물체 거리 최소화"로 푸는데 이에 대한 임계값
+=> interaction-thresh 0.10 손이 물체와 10 cm를 기준으로 Interaction인지 파악
+
+4) Contact map 추출할 때 frame을 버리기위한 조건(앵커를 누적할 프레임 목록에서 제외)
+=> max-gap-after 1.0 보정 후 손끝 간격 1 cm 넘으면 버림
+But, 1)이 존재할 때는 이 조건 무시
+
+6) CHOIR stage2에서 FM이 contact candidate를 추출할 때의 조건
+=> ANCHOR_MAX_DIST = 0.02 2 cm 이내만 대응으로 인정
+=> ANCHOR_CONE_DEG = 60.0 손 법선이 물체 방향과 60° 이내
+
+7) 오라클이 ray방향으로 얼마나 보정할지 결정
+=> scan-range 0.25 z*를 ±25 cm 범위에서 탐색
+
+* Frame마다 ray방향 depth보정값이 다 다름
+
+<Reward 관련 상수>
+attract_scale 3.0 [Palm_inside]
+repel_scale 2.0 [Palm_outside]
+α 0.05 [Contact map에 대한 가중치 => 접촉 유도가 아닌 "어디를 접촉해야할지"에 대한 가중치]
+max_points 64/1024 [Hand의 64개 Contact Candidate / Object surface Contact Candidate]
+robot_contact_free_radius 0.02 [Mapping 되지 않은 Link에만 적용되는 거리 임계값]
+ 
+*유의해야할 점 : Do-as-I-do의 목적함수에는 reference추종 항(hand, finger, object)과 
+손바닥 contact map + 물체 contact map을 활용한 항이 존재 => 3개의 scale이 모두 맞는지 매번 최적화과정 이후 graph로 시각화 수행
+
+*현재는 contact_region_reward파일을 사용하지 않고 robot_contact_reward파일을 사용하여 reward 계산 수행

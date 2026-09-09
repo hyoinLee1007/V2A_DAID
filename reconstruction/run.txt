@@ -1,0 +1,113 @@
+새로운 영상을 reconstruction 하는 방법
+
+-------------------------------------------------------------------------------------------------
+{RECONSTRUCTION}
+
+1.reconstruction 하위 폴더를 만들어서 .mp4 파일 넣음
+
+2-1.영상의 프레임 수 확인
+ffprobe -v error \
+  -select_streams v:0 \
+  -count_packets \
+  -show_entries stream=nb_read_packets \
+  -of csv=p=0 \
+  my_task/my_video.mp4
+
+2-2.영상을 프레임별로 변환 (영상이 있는 디렉토리에서)
+mkdir -p check_frames
+ffmpeg -i putcup_input.mp4 check_frames/frame_%06d.png
+
+3. 영상 처리
+./run_pipeline.sh <영상경로> <기준프레임> <물체이름> <손방향>
+
+ex) ./run_pipeline.sh dataset/whisking/whisking.mp4 125 whisk right
+
+cf) 영상의 기준 프레임은 '물체가 심하게 가려지지않고,
+물체 전체 형상이 잘 보이는 Frame 선택
+
+4. reconstruction 결과를 Visualize 하는 명령어
+cd ~/do-as-i-do/reconstruction/scripts
+conda activate sam3d-objects
+
+LAYOUT=/home/intern/do-as-i-do/reconstruction/dataset/cupmove/obj_tracking_out/cup/combined_visualization/layout_camera_frame_optimized.json
+
+MESH_SCALE=$(python -c "
+import json
+d=json.load(open('$LAYOUT'))
+print(d['translation_scale_optimization']['mesh_scale'])
+")
+
+echo "$MESH_SCALE"
+
+python visualize_3d.py \
+  --frames-dir /home/intern/do-as-i-do/reconstruction/dataset/appleinput/all_frames \
+  --layout-json "$LAYOUT" \
+  --mesh /home/intern/do-as-i-do/reconstruction/dataset/appleinput/video_segmentation/masks/frame_000020_masks/cup/cup.obj \
+  --scale "$MESH_SCALE" \
+  --translation-scale 1.0 \
+  --hand-meshes /home/intern/do-as-i-do/reconstruction/dataset/cupmove/cupmove/all_hand_meshes.npz \
+  --port 8080
+  
+5. 시각화 결과에서 Object Pose가 흔들리는 경우 Smoothing을 진행(run_pipeline.sh에 명시됨) 및 시각화
+<Smoothing>
+cd /home/intern/do-as-i-do/reconstruction/scripts
+conda activate sam3d-objects
+
+python smooth_trajectory.py \
+  --input /home/intern/do-as-i-do/reconstruction/dataset/appleinput/obj_tracking_out/apple/combined_visualization/layout_camera_frame_optimized.json \
+  --output /home/intern/do-as-i-do/reconstruction/dataset/appleinput/obj_tracking_out/apple/combined_visualization/layout_camera_frame_optimized_smooth.json
+  
+ 
+<Visualize>
+LAYOUT=/home/intern/do-as-i-do/reconstruction/dataset/appleinput/obj_tracking_out/apple/combined_visualization/layout_camera_frame_optimized_smooth.json
+
+MESH_SCALE=$(python -c "
+import json
+d=json.load(open('$LAYOUT'))
+print(d['translation_scale_optimization']['mesh_scale'])
+")
+
+echo "$MESH_SCALE"
+
+
+python visualize_3d.py \
+  --frames-dir /home/intern/do-as-i-do/reconstruction/dataset/appleinput/all_frames \
+  --layout-json /home/intern/do-as-i-do/reconstruction/dataset/appleinput/obj_tracking_out/apple/combined_visualization/layout_camera_frame_optimized_smooth.json \
+  --mesh /home/intern/do-as-i-do/reconstruction/dataset/appleinput/video_segmentation/masks/frame_000046_masks/cup/cup.obj \
+  --scale "$MESH_SCALE" \
+  --translation-scale 1.0 \
+  --hand-meshes /home/intern/do-as-i-do/reconstruction/dataset/cupmove/cupmove/all_hand_meshes.npz \
+  --port 8080
+  
+<손이 인식되지않은 경우,별도로 손 mask 생성 &  optimize.json생성> 
+[MASK 생성]
+conda activate sam3
+
+cd /home/intern/do-as-i-do/reconstruction/scripts
+
+python run_sam3_video.py \
+  --video /home/intern/do-as-i-do/reconstruction/dataset/dexycb_back/dexycb_back.mp4 \
+  --click \
+  --obj_id right_hand_0 \
+  --frame_idx 19
+  
+[Optimize Json파일 생성]
+conda activate sam3d-objects
+
+cd /home/intern/do-as-i-do/reconstruction/scripts
+
+python optimize_translation_scale.py \
+  --video-dir /home/intern/do-as-i-do/reconstruction/dataset/dexycb_back \
+  --layout-json /home/intern/do-as-i-do/reconstruction/dataset/dexycb_back/obj_tracking_out/cup/combined_visualization/layout_camera_frame.json \
+  --anchor-hand right \
+  --ref-frame 19
+
+
+  
+<ISSUE>
+- 손과 물체가 같이 있는 Frame을 선택해야하고, reference Frame에서 손을 SAM3D가 인식하지 못하는 경우 run_sam3_~ 스크립트 파일을 통해서 click을 통해 인식할 수 있음
+
+- 손이 물체랑 떨어져있어도 되는데 초기자세 자체가 손바닥의 방향이 물체를 바라보는 방향이어야만 함
+
+- init발동해서 손바닥의 위치가 떨어지게끔하는게 뭔가 있나본데? 언제 발동하냐면 100mm이하로 떨어져있을때임
+ 

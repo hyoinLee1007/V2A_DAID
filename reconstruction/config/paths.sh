@@ -26,7 +26,7 @@ export TAPNET_CKPT="$WEIGHTS_DIR/tapnet/bootstapir_checkpoint_v2.pt"
 # pre-existing local envs, your sam3d env may be named differently
 # (sam3 / hawor / tapnet already match) — set ENV_SAM3D accordingly.
 export ENV_SAM3=sam3
-export ENV_SAM3D=sam3d
+export ENV_SAM3D=sam3d-objects
 export ENV_HAWOR=hawor
 export ENV_TAPNET=tapnet
 

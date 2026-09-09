@@ -1,0 +1,39 @@
+{RETARGETING}
+
+cd /home/intern/do-as-i-do/retargeting
+conda activate retargeting
+
+  1.smoothing 된 궤적을 사용한다고 가정하면 기존의 optimized 된 파일 말고 optimized_raw.json을 사용해야함
+  이를 위해서는 심볼릭 링크를 사용
+  
+1-1. 기존 원본 보관
+POSE_DIR=/home/intern/do-as-i-do/reconstruction/dataset/appleinput/obj_tracking_out/apple/combined_visualization
+
+mv \
+"$POSE_DIR/layout_camera_frame_optimized.json" \
+"$POSE_DIR/layout_camera_frame_optimized_raw.json"
+
+1-2. smooth 파일을 기대 파일명으로 심볼릭 링크
+ln -s \
+"$POSE_DIR/layout_camera_frame_optimized_smooth.json" \
+"$POSE_DIR/layout_camera_frame_optimized.json"
+
+1-3. CHECK !
+ls -lh "$POSE_DIR"/layout_camera_frame_optimized*
+readlink -f "$POSE_DIR/layout_camera_frame_optimized.json" 
+위의 명령어 출력의 마지막이 '.../layout_camera_frame_optimized_smooth.json'여야 함
+
+
+2.Retargeting 실행
+
+python launch.py \
+  --task appleinput \
+  --raw-dir ../reconstruction/dataset/appleinput
+  
+2-1. Retargeting된 궤적 REPLAY
+python replay_viser.py \
+  --run-dir outputs/sharpa/left/cupmove/0 \
+  --port 8081
+  
+3. Optimization과정에서 목적함수의 cost항 비교 Graph Visualization
+python viz_reward_terms.py   --run-dir outputs/sharpa/left/cupmove/0 --label "palm 1000"   --run-dir outputs/sharpa/left/cupmove_palmside_scale1/0 --label "palm 1"

@@ -1,0 +1,5 @@
+ffmpeg -framerate 30 \
+-i color_%06d.jpg \
+-c:v libx264 \
+-pix_fmt yuv420p \
+output.mp4

@@ -71,6 +71,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=8081, help="Viser server port.")
     p.add_argument("--fps", type=float, default=60.0, help="Initial playback FPS.")
     p.add_argument(
+        "--play-reference",
+        nargs="?",
+        const="tracked",
+        default=None,
+        choices=("tracked", "raw"),
+        help="Play a reference as the main trajectory instead of the optimizer's "
+             "output. 'tracked' (the default when the flag is given bare) is "
+             "qpos_ref, i.e. what the optimizer actually followed, after "
+             "de-penetration and the warmup offset decay. 'raw' is qpos_ref_raw, "
+             "the same reference before those corrections — pass both in turn to "
+             "see what the corrections did. Neither is trajectory_kinematic.npz, "
+             "the 78-frame raw IK output that the blue ghost layer draws.",
+    )
+    p.add_argument(
         "--skip-warmup",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -250,7 +264,19 @@ def main() -> None:
     model = spec.compile()
     data = mujoco.MjData(model)
 
-    qpos = load_qpos(traj_path, model.nq)
+    if args.play_reference:
+        key = "qpos_ref" if args.play_reference == "tracked" else "qpos_ref_raw"
+        _d = np.load(str(traj_path), allow_pickle=True)
+        if key not in _d.files:
+            raise SystemExit(
+                f"'{key}' not in {traj_path} — this run predates the change that "
+                "saves the reference. Re-run the optimization.")
+        qpos = np.ascontiguousarray(
+            np.asarray(_d[key], np.float64).reshape(-1, model.nq))
+        print(f"playing the {args.play_reference.upper()} REFERENCE "
+              f"('{key}', {len(qpos)} steps), not the optimized trajectory")
+    else:
+        qpos = load_qpos(traj_path, model.nq)
 
     # IK reference (blue ghost) — optional.
     kin_qpos = None

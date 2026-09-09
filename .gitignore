@@ -1,0 +1,16 @@
+# Reconstruction inputs and outputs. dataset/ alone is 32 GB.
+reconstruction/dataset/
+reconstruction/heatmap_out/
+reconstruction/dexycb_heatmap_out/
+reconstruction/whisking/
+reconstruction/archive_unused/
+overlay_frames/
+
+# Retargeting run outputs (scenes, trajectories, generated maps).
+retargeting/outputs/
+retargeting/physics_verification/
+
+# Scratch
+*.swp
+*.backup
+projection_stats.csv

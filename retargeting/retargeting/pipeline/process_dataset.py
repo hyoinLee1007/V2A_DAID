@@ -379,6 +379,7 @@ def main(
     dataset_name: str = "do_as_i_do",
     force: bool = False,
     start_frame: int = 0,
+    ray_depth_path: str = "",
 ) -> str:
     output_root_dir = os.path.abspath(output_root_dir)
     raw_dir = os.path.abspath(raw_dir)
@@ -445,6 +446,23 @@ def main(
         left_hand_pose = meshes["left_hand_pose"].astype(np.float64)   # (N, 45)
         left_betas = meshes["left_betas"].astype(np.float64)           # (N, 10)
         N = left_joints.shape[0]
+
+    # Ray-depth correction (CHOIR Stage 2), applied here so that everything
+    # downstream — the IK reference, the pedestal decision, the tracked object
+    # poses — is built from a hand track that is in the right place. Doing it
+    # later, or only inside the contact-map extractor, leaves the reference
+    # wrong and makes the reward argue with it.
+    #
+    # It must happen before the gravity alignment below: the ray is defined in
+    # the camera frame, where the camera sits at the origin.
+    if ray_depth_path:
+        from retargeting.utils.ray_depth_correction import correct_hand_track
+        if process_right:
+            right_vertices, right_joints = correct_hand_track(
+                right_vertices, right_joints, ray_depth_path, "right")
+        if process_left:
+            left_vertices, left_joints = correct_hand_track(
+                left_vertices, left_joints, ray_depth_path, "left")
 
     loguru.logger.info(f"Loaded hand data: {N} frames from {npz_path}")
 

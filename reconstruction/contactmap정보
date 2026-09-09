@@ -1,0 +1,7 @@
+1. SAM3D의 output은 정규화된 크기이고, 여기에 mesh_scale을 곱해야 실제 Meter단위가 됨
+=> 미터단위로 변환해야하는 이유는 Mujoco 물리 자체가 실제 단위를 요구
++ 히트맵의 npz의 vertices는 보상 계산에 전혀 안쓰임
+
+2. 실제 mujoco의 충돌계산시 visual.obj파일을 사용하는데 내가 수동으로 작업한 manual_contact_heatmap.py로 작업할 때는 Open3d로 로드하면서
+순서가 바뀜 -> 따라서, 이를 VLM으로 추론할 때는 npz파일에서 v줄을 직접 파싱하거나 open3d인덱스를 파일 순서로 되돌리면 후처리가 불필요함
+v줄을 cup.obj나 visual.obj에 있음 이를 파싱해서 히트맵만들면 순서는 알아서 정렬된 상태임

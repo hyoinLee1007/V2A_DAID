@@ -21,8 +21,13 @@ from retargeting.utils.in_hand import (
     extract_body_mesh_verts,
 )
 from retargeting.utils.interp import align_to_sim_dt
+from retargeting.utils.contact_region_reward import compute_contact_region_penalty
+from retargeting.utils.robot_contact_reward import compute_robot_contact_terms
+from retargeting.utils.warmup_backoff_direction import heatmap_backoff_direction
+from retargeting.utils.warmup_backoff_gate import should_apply_backoff
 from retargeting.utils.io import get_processed_data_dir
 from retargeting.utils.math import quat_sub
+from retargeting.utils.wrist_floor_penalty import compute_wrist_floor_penalty
 
 # Initialize Warp once per process
 try:
@@ -692,7 +697,6 @@ def _euler_xyz_to_rotmat_batch(
 # MANO palm geometry constants (from site definitions in right.xml / left.xml)
 _RIGHT_PALM_OFFSET = torch.tensor([-0.0946604, -0.00147896, -0.00335754])
 _LEFT_PALM_OFFSET = torch.tensor([0.0946604, -0.00147896, -0.00335754])
-_PALM_NORMAL_LOCAL = torch.tensor([0.0, -1.0, 0.0])
 
 
 def _get_palm_geometry(
@@ -719,8 +723,15 @@ def _build_hand_specs(
 ) -> list[dict]:
     """Per-hand specs for analytical init pose placement.
 
-    Returns one dict per hand with: side, pos_idx, rot_idx, palm_normal_local,
-    obj_pos.  All tensors are placed on `device`.
+    Returns one dict per hand with: side, pos_idx, rot_idx, retreat_axis_local,
+    obj_pos.  ``retreat_axis_local`` is the unit wrist->palm axis (palm_offset,
+    the palm site's local position relative to the wrist body), normalized.
+    ``warmup_analytical_init`` only falls back to it when no mesh data is
+    available to derive a direction from actual hand/object geometry;
+    normally the data-driven nearest-pair direction is used instead, since
+    any fixed hand-frame axis (this one, or the palm normal) is just a proxy
+    for "away from the object" and can be wrong under reconstruction error.
+    All tensors are placed on `device`.
     """
     nq = qpos_ref_0.shape[0]
     nq_obj = config.nq_obj
@@ -728,8 +739,10 @@ def _build_hand_specs(
 
     right_geom = _get_palm_geometry(env.model_cpu, "right")
     left_geom = _get_palm_geometry(env.model_cpu, "left")
-    r_normal = (right_geom[1] if right_geom else _PALM_NORMAL_LOCAL).to(device)
-    l_normal = (left_geom[1] if left_geom else _PALM_NORMAL_LOCAL).to(device)
+    r_offset = (right_geom[0] if right_geom else _RIGHT_PALM_OFFSET).to(device)
+    l_offset = (left_geom[0] if left_geom else _LEFT_PALM_OFFSET).to(device)
+    r_retreat = r_offset / r_offset.norm()
+    l_retreat = l_offset / l_offset.norm()
 
     specs: list[dict] = []
     if config.embodiment_type == "bimanual":
@@ -744,14 +757,14 @@ def _build_hand_specs(
             "side": "right",
             "pos_idx": [0, 1, 2],
             "rot_idx": [3, 4, 5],
-            "palm_normal_local": r_normal,
+            "retreat_axis_local": r_retreat,
             "obj_pos": right_obj_pos,
         })
         specs.append({
             "side": "left",
             "pos_idx": [half, half + 1, half + 2],
             "rot_idx": [half + 3, half + 4, half + 5],
-            "palm_normal_local": l_normal,
+            "retreat_axis_local": l_retreat,
             "obj_pos": left_obj_pos,
         })
     elif config.embodiment_type in ("right", "left"):
@@ -759,12 +772,12 @@ def _build_hand_specs(
             obj_pos = qpos_ref_0[-7:-4].to(device)
         else:
             obj_pos = qpos_ref_0[-6:-3].to(device)
-        normal = r_normal if config.embodiment_type == "right" else l_normal
+        retreat_axis = r_retreat if config.embodiment_type == "right" else l_retreat
         specs.append({
             "side": config.embodiment_type,
             "pos_idx": [0, 1, 2],
             "rot_idx": [3, 4, 5],
-            "palm_normal_local": normal,
+            "retreat_axis_local": retreat_axis,
             "obj_pos": obj_pos,
         })
     return specs
@@ -777,25 +790,40 @@ def warmup_analytical_init(
     ctrl_ref_0: torch.Tensor,
     finger_qpos_indices: list[int],
 ) -> dict:
-    """Translate each hand along -palm_normal until it clears the object.
+    """Translate each hand a fixed distance directly away from the object, then FK.
 
-    Solves per hand for the smallest offset t ≥ 0 along -n_world such that
-    every robot-hand mesh vertex (FK'd at the closed-grasp pose
-    ``qpos_ref[0]``) is at least ``warmup_min_clearance`` from every object
-    mesh vertex. Hands are solved independently; no mjwarp forward /
-    penetration check.
+    Per hand: computes the hand-mesh and object-mesh centroids (FK'd at the
+    closed-grasp pose ``qpos_ref[0]``) and moves the hand ``warmup_min_clearance``
+    meters straight along the object-centroid -> hand-centroid direction.
+    Hands are solved independently; no mjwarp forward / penetration check.
+
+    This is deliberately simple — just "push the hand N cm away from the
+    object" — rather than solving for the minimal offset that clears every
+    mesh vertex pair. Earlier attempts derived the direction from a single
+    hand-frame axis (palm normal, or wrist->palm) or from the single closest
+    hand/object vertex pair; both can end up pointing somewhere other than
+    "away from the object as a whole" (tangential to the real violation, or
+    following whatever a single nearby vertex pair happens to imply — e.g.
+    up and over a cup's rim), and neither has anything to do with getting to
+    the actual target contact (e.g. the handle). Separating the hand from
+    the object here is only meant to give the optimizer a penetration-free
+    start; getting to the right contact point is qpos_rew's job, tracking
+    wherever the reference trajectory actually goes from there. Falls back
+    to the wrist->palm axis (see ``_build_hand_specs``) only when no mesh
+    data is available to compute a centroid.
+
+    The chosen offset's z is then clamped to stay at least ``floor_margin``
+    above the floor (or 0.0 if the scene has no collidable floor geom, as in
+    do_as_i_do): hand_floor_collision is disabled there, so nothing in the
+    physics itself would otherwise stop this analytical placement — or a
+    later exploding rollout seeded from it — from leaving the wrist
+    underground.
 
     Uses the robot's own mesh, not the MANO surface — MANO underestimates
     a chunky robot's reach in flat-palm grasps (e.g. closing a laptop lid),
     where palm and fingertips extend past it. Using the closed-grasp pose
     is conservative for the actual sim init, which has fingers zeroed and
     therefore sweeps further from the object.
-
-    Per-pair math: with d = hand_pt − vert, α = n·d, perp² = ||d||² − α²,
-    and clearance c, the pair constrains t only when ||d|| < c (currently
-    inside clearance) and perp² < c² (back-off direction passes through
-    violation). Then t_pair = max(0, α + √(c² − perp²)). The chosen t is
-    the max over pairs.
 
     Writes the final pose into ``env.data_wp.qpos``, ``ctrl``, ``qvel``.
     """
@@ -820,15 +848,16 @@ def warmup_analytical_init(
     for spec in specs:
         side = spec["side"]
         rot_idx = spec["rot_idx"]
-        palm_normal_local = spec["palm_normal_local"]
+        retreat_axis_local = spec["retreat_axis_local"]
 
-        # World-frame palm normal from the reference wrist orientation.
+        # Fallback direction (wrist->palm axis) for the degenerate case below
+        # where no mesh data is available to derive a data-driven direction.
         ex = base_qpos[rot_idx[0]:rot_idx[0] + 1]
         ey = base_qpos[rot_idx[1]:rot_idx[1] + 1]
         ez = base_qpos[rot_idx[2]:rot_idx[2] + 1]
         R = _euler_xyz_to_rotmat_batch(ex, ey, ez)[0]
-        n_world_t = R @ palm_normal_local                                  # (3,) torch
-        n_world = n_world_t.detach().cpu().numpy().astype(np.float64)      # (3,) numpy
+        fallback_n_world_t = R @ retreat_axis_local                        # (3,) torch
+        fallback_n_world = fallback_n_world_t.detach().cpu().numpy().astype(np.float64)
 
         # Resolve to the meshed object body — for a bimanual shared object the
         # meshless placeholder side falls back to the real geometry.
@@ -855,9 +884,10 @@ def warmup_analytical_init(
                 "leaving hand at reference pose.", side,
             )
             t_chosen = 0.0
-            closest_hand_idx = -1
             final_min_dist = float("nan")
             ok = False
+            n_world_t = fallback_n_world_t
+            n_world = fallback_n_world
         else:
             obj_verts_w = extract_body_mesh_verts(
                 env.model_cpu, obj_body_id, data=fk_data, apply_geom_xform=True,
@@ -868,19 +898,46 @@ def warmup_analytical_init(
             if obj_verts_w.shape[0] > 4000:
                 obj_verts_w = obj_verts_w[:: (obj_verts_w.shape[0] + 3999) // 4000]
 
-            # Closed-form solve for smallest t >= 0 such that
-            #   ||(hand_pt − t·n) − vert|| >= clearance for every (hand_pt, vert).
-            d = hand_pts[:, None, :] - obj_verts_w[None, :, :]   # (Vh, V, 3)
-            n_dot_d = d @ n_world                                # (Vh, V)
-            d_norm_sq = (d ** 2).sum(-1)                         # (Vh, V)
-            perp_sq = d_norm_sq - n_dot_d ** 2                   # (Vh, V)
-            delta = clearance * clearance - perp_sq              # (Vh, V)
-            r_hi = n_dot_d + np.sqrt(np.maximum(delta, 0.0))     # (Vh, V)
-            active = (delta > 0) & (d_norm_sq < clearance ** 2)
-            t_pair = np.where(active, np.maximum(r_hi, 0.0), 0.0)
-            flat_idx = int(t_pair.argmax())
-            closest_hand_idx, _ = divmod(flat_idx, t_pair.shape[1])
-            t_chosen = float(t_pair.flat[flat_idx])
+            # Simple centroid separation: push the hand a fixed distance
+            # (warmup_min_clearance) directly away from the object, along
+            # hand-centroid -> object-centroid. No per-vertex clearance
+            # solve — that guaranteed every mesh pair cleared, but the
+            # "guaranteeing" direction was whichever single vertex pair
+            # happened to be closest, which on cupmove pointed up over the
+            # rim rather than simply away from the cup. This is a plain,
+            # predictable "move apart by N cm"; qpos_rew is what should then
+            # pull the hand toward wherever the reference trajectory
+            # actually goes (e.g. sideways onto the handle), not this step.
+            hand_centroid = hand_pts.mean(axis=0)
+            obj_centroid = obj_verts_w.mean(axis=0)
+            away = hand_centroid - obj_centroid
+            away_norm = float(np.linalg.norm(away))
+            n_world = -away / away_norm if away_norm > 1e-9 else fallback_n_world
+            # Opt-in: back off toward the heatmap's handle region instead of
+            # along the hand's own radial direction — see
+            # warmup_backoff_direction.py. n_world is the direction the wrist
+            # is translated *against* below (new_pos = base - t * n_world).
+            if config.warmup_backoff_mode == "heatmap":
+                d = heatmap_backoff_direction(
+                    config, env.model_cpu, fk_data, side, obj_centroid,
+                )
+                if d is not None:
+                    n_world = -d
+            n_world_t = torch.tensor(n_world, device=device, dtype=torch.float32)
+            # Optional gate: skip the backoff entirely (start pose = reference)
+            # when the hand already begins clear of the object — see
+            # warmup_backoff_gate.py.
+            apply_backoff, ref_min_dist = should_apply_backoff(
+                config, hand_pts, obj_verts_w,
+            )
+            t_chosen = clearance if apply_backoff else 0.0
+            if not apply_backoff:
+                loguru.logger.info(
+                    "Warmup ({}): hand starts {:.4f}m clear of the object at the "
+                    "reference pose (> warmup_backoff_trigger_dist={:.3f}m); "
+                    "skipping analytical backoff — start pose stays at the reference.",
+                    side, ref_min_dist, float(config.warmup_backoff_trigger_dist),
+                )
 
             new_hand_pts = hand_pts - t_chosen * n_world
             final_min_dist = float(np.linalg.norm(
@@ -894,9 +951,17 @@ def warmup_analytical_init(
             "n_world": n_world_t,
             "t_chosen": t_chosen,
             "ok": ok,
-            "closest_hand_idx": int(closest_hand_idx),
             "final_min_dist": final_min_dist,
         })
+
+    # Floor safety net: do_as_i_do runs with hand_floor_collision disabled, so
+    # nothing in the physics stops the warmup offset (or a later exploding
+    # rollout seeded from it) from placing/leaving the wrist below the floor.
+    # Clamp the z the warmup itself writes; floor_z falls back to 0.0 when
+    # there's no collidable floor geom in the scene (do_as_i_do's case).
+    floor_id = _collidable_floor_geom_id(env.model_cpu)
+    floor_z = float(env.model_cpu.geom_pos[floor_id][2]) if floor_id >= 0 else 0.0
+    floor_margin = float(config.warmup_floor_margin)
 
     # Combine: apply each hand's chosen offset on top of base_qpos.
     final_qpos = base_qpos.clone()
@@ -904,7 +969,9 @@ def warmup_analytical_init(
     for r in hand_results:
         idx = torch.tensor(r["pos_idx"], device=device, dtype=torch.long)
         offset = float(r["t_chosen"]) * r["n_world"]
-        final_qpos[idx] = base_qpos[idx] - offset
+        new_pos = base_qpos[idx] - offset
+        new_pos[2] = torch.clamp(new_pos[2], min=floor_z + floor_margin)
+        final_qpos[idx] = new_pos
         final_ctrl[idx] = final_qpos[idx]
 
     zero_qvel = torch.zeros(
@@ -924,9 +991,8 @@ def warmup_analytical_init(
     wp.synchronize()
 
     summary = ", ".join(
-        "{} t={:.3f}m closest_hand_vert={} min_dist={:.4f}m ok={}".format(
-            r["side"], r["t_chosen"], r["closest_hand_idx"],
-            r["final_min_dist"], r["ok"],
+        "{} t={:.3f}m min_dist={:.4f}m ok={}".format(
+            r["side"], r["t_chosen"], r["final_min_dist"], r["ok"],
         )
         for r in hand_results
     )
@@ -1084,57 +1150,94 @@ def get_reward(
     sim_step indexes the per-frame in-hand gate used by the pedestal-mismatch
     penalty (same gate as the random-perturbation gate).
     """
-    qpos_ref, qvel_ref, ctrl_ref, contact_ref, contact_pos_ref = ref
-    qpos_sim = wp.to_torch(env.data_wp.qpos)
-    qvel_sim = wp.to_torch(env.data_wp.qvel)
+    qpos_ref, qvel_ref, ctrl_ref, contact_ref, contact_pos_ref = ref # 이번 Horizon 스탭의 reference Unpack
+    qpos_sim = wp.to_torch(env.data_wp.qpos) # 병렬 world 전체의 현재 sim qpos (Warp→torch)
+    qvel_sim = wp.to_torch(env.data_wp.qvel) # 현재 sim qvel
 
     qpos_diff = _diff_qpos(
         config, qpos_sim, qpos_ref.unsqueeze(0).expand(qpos_sim.shape[0], -1)
-    )
+    ) # quaternion 등 고려한 qpos 차이
     if not hasattr(config, "_qpos_weight_cache"):
-        config._qpos_weight_cache = _weight_diff_qpos(config)
-    delta_qpos = qpos_diff * config._qpos_weight_cache
-    qpos_dist = torch.norm(delta_qpos, p=2, dim=1)
-    qvel_dist = torch.norm(qvel_sim - qvel_ref, p=2, dim=1)
+        config._qpos_weight_cache = _weight_diff_qpos(config)  # DOF별 가중치, 최초 1회만 계산해 캐시
+    delta_qpos = qpos_diff * config._qpos_weight_cache  # 가중치 적용된 qpos 오차
+    qpos_dist = torch.norm(delta_qpos, p=2, dim=1)  # world별 스칼라 추종 오차
+    qvel_dist = torch.norm(qvel_sim - qvel_ref, p=2, dim=1)  # world별 속도 추종 오차
 
-    qpos_rew = -qpos_dist * 1.0
-    qvel_rew = -config.vel_rew_scale * qvel_dist * 1.0
+    qpos_rew = -qpos_dist * 1.0  # 오차의 음수 = 보상
+    qvel_rew = -config.vel_rew_scale * qvel_dist * 1.0  # 속도 보상, vel_rew_scale=0.0001로 아주 작은 비중
 
     if not hasattr(config, "_qpos_group_slices"):
-        config._qpos_group_slices = _build_qpos_group_slices(config)
+        config._qpos_group_slices = _build_qpos_group_slices(config)  # 손목/손가락/물체 등 부위별 인덱스, 최초 1회만 계산
     qpos_group_rew = {}
     for name, idx in config._qpos_group_slices.items():
-        qpos_group_rew[name] = -torch.norm(delta_qpos[:, idx], p=2, dim=1)
+        qpos_group_rew[name] = -torch.norm(delta_qpos[:, idx], p=2, dim=1)  # 부위별 오차, info 로깅용 (reward엔 직접 미포함)
 
-    if config.contact_rew_scale > 0.0 and len(config.contact_site_ids) > 0:
+    if config.contact_rew_scale > 0.0 and len(config.contact_site_ids) > 0:  # 기본값(0.0)이면 통째로 스킵 → 지금은 no-op
         site_xpos_torch = wp.to_torch(env.data_wp.site_xpos)
-        contact_pos = site_xpos_torch[:, config.contact_site_ids]
-        contact_dist = torch.norm(contact_pos - contact_pos_ref, p=2, dim=-1)
-        contact_dist_masked = contact_dist * contact_ref.unsqueeze(0)
+        contact_pos = site_xpos_torch[:, config.contact_site_ids]  # 물체쪽 접촉 site의 현재 위치
+        contact_dist = torch.norm(contact_pos - contact_pos_ref, p=2, dim=-1)  # 레퍼런스 접촉위치와의 거리
+        contact_dist_masked = contact_dist * contact_ref.unsqueeze(0)  # "지금 접촉해야 함" 마스크로 게이팅
         contact_rew = -contact_dist_masked.sum(dim=1)
     else:
         contact_rew = 0.0
 
-    reward = qpos_rew + qvel_rew + contact_rew
+    reward = qpos_rew + qvel_rew + contact_rew  # 기본 보상 = 세 항의 합
 
     # Margin so light surface contact (< margin) is not penalized, only deeper
     # clip-through penetration is.
     pen_penalty = torch.zeros_like(reward)
     if config.penetration_penalty_scale > 0.0:
-        pen, wid = check_penetration(config, env)
-        pen = torch.clamp(pen - config.penetration_margin, min=0.0)
+        pen, wid = check_penetration(config, env)  # 손-물체 관통 깊이, 그 접촉이 속한 world id
+        pen = torch.clamp(pen - config.penetration_margin, min=0.0)  # 마진(margin) 이하의 얕은 접촉은 봐줌
         pen_sq = pen * pen
         pen_penalty = torch.zeros(env.num_worlds, device=config.device)
-        pen_penalty.scatter_reduce_(0, wid, pen_sq, reduce="amax", include_self=True)
+        pen_penalty.scatter_reduce_(0, wid, pen_sq, reduce="amax", include_self=True)  # world별 "가장 심한 관통"만 취함(합산 아님)
         pen_penalty = config.penetration_penalty_scale * pen_penalty
         reward = reward - pen_penalty
 
     drop_penalty = torch.zeros_like(reward)
     if config.drop_penalty_scale > 0.0:
         obj_z = _get_object_z(config, qpos_sim)
-        drop = torch.clamp(config.drop_z_thresh - obj_z, min=0.0)
+        drop = torch.clamp(config.drop_z_thresh - obj_z, min=0.0)  # 기준 높이 아래로 떨어진 만큼
         drop_penalty = config.drop_penalty_scale * (drop * drop).sum(dim=-1)
         reward = reward - drop_penalty
+
+    wrist_floor_penalty = torch.zeros_like(reward)
+    if config.wrist_floor_penalty_scale > 0.0:
+        wrist_floor_penalty = compute_wrist_floor_penalty(config, qpos_sim)
+        reward = reward - wrist_floor_penalty
+
+    contact_region_penalty = torch.zeros_like(reward)
+    # Optionally hold the heatmap contact term off until warmup ends: during
+    # warmup the object is welded and gravity is off, so a large
+    # contact_region_rew_scale otherwise dominates the interpolated warmup
+    # reference and drags the hand onto the object before warmup is over.
+    #
+    # Gated on the step being *executed* (``warmup_sim_step``, the chunk start)
+    # rather than this rollout step, so the term is off across the whole
+    # planning horizon while warmup is still running. Gating per rollout step
+    # is not enough: with horizon_steps == warmup_steps == 600 and 100-step
+    # chunks, planning the 500->600 chunk already scores 500 post-warmup steps
+    # where the term is live, and since warmup motion is nearly free (welded
+    # object, no gravity, tiny tracking weight) the optimizer front-loads the
+    # approach into warmup to arrive exactly when the term switches on.
+    _in_warmup = int(config.warmup_sim_step) < int(config.warmup_steps)
+    if config.contact_region_rew_scale > 0.0 and not (
+        config.contact_region_skip_warmup and _in_warmup
+    ):
+        contact_region_penalty = compute_contact_region_penalty(config, env, qpos_sim)
+        reward = reward - contact_region_penalty
+
+    # Robot-skin contact term. Same warmup reasoning as above, and the same
+    # gate on the executed step rather than the rollout step.
+    robot_contact_attract = torch.zeros_like(reward)
+    robot_contact_repel = torch.zeros_like(reward)
+    if (config.robot_contact_attract_scale > 0.0
+            or config.robot_contact_repel_scale > 0.0) and not (
+                config.robot_contact_skip_warmup and _in_warmup):
+        robot_contact_attract, robot_contact_repel = compute_robot_contact_terms(
+            config, env, qpos_sim)
+        reward = reward - robot_contact_attract - robot_contact_repel
 
     # Rest/in-hand contact-mismatch penalties: keep the simulated object's
     # contact state consistent with the reference, separately per rest surface
@@ -1147,13 +1250,13 @@ def get_reward(
         scale=config.pedestal_penalty_scale,
         surface_mask=any_pedestal,
         surface="pedestal",
-    )
+    )  # 손-물체/물체-받침대 접촉상태가 레퍼런스(그 프레임엔 잡고있어야 함/놓여있어야 함)와 어긋나면 페널티
     floor_pens = _rest_surface_penalty(
         reward, env, config, sim_step,
         scale=config.floor_penalty_scale,
         surface_mask=config._is_floor_geom,
         surface="floor",
-    )
+    )  # pedestal 대신 바닥에 놓이는 경우의 동일한 페널티
     for pens in (pedestal_pens, floor_pens):
         for pen in pens.values():
             reward = reward - pen
@@ -1165,10 +1268,14 @@ def get_reward(
         "qvel_rew": qvel_rew,
         "pen_penalty": pen_penalty,
         "drop_penalty": drop_penalty,
+        "wrist_floor_penalty": wrist_floor_penalty,
+        "contact_region_penalty": contact_region_penalty,
+        "robot_contact_attract": robot_contact_attract,
+        "robot_contact_repel": robot_contact_repel,
         **{f"pedestal_{s}": p for s, p in pedestal_pens.items()},
         **{f"floor_{s}": p for s, p in floor_pens.items()},
         **qpos_group_rew,
-    }
+    }  # 로깅/시각화용 진단 정보 — reward 자체에는 이미 다 반영됨, 최적화 신호가 아니라 모니터링용
     return reward, info
 
 

@@ -9,7 +9,7 @@
 #   3  object tracking using guided pose prediction ; project mesh ; layout -> camera frame        [sam3d]
 #   4  optimize translation/scale (+ optional viser viz)                     [sam3d]
 #
-# Usage:  ./run_pipeline.sh VIDEO_PATH [FRAME_N] [OBJECT] [ANCHOR_HAND]
+# Usage:  ./run_pipeline.sh VIDEO_PATH [FRAME_N] [OBJECT] [HAND_MODE] [ALIGN_HAND]
 # Example: ./run_pipeline.sh /data/pickplan_pan/pickplan_pan.mp4 28 pan right
 set -eo pipefail
 
@@ -17,7 +17,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/config/paths.sh"
 
 # ──────────────────────────── Per-run inputs (args) ────────────────────────────
-VIDEO_PATH="${1:?usage: run_pipeline.sh VIDEO_PATH [FRAME_N] [OBJECT] [ANCHOR_HAND]}"
+VIDEO_PATH="${1:?usage: run_pipeline.sh VIDEO_PATH [FRAME_N] [OBJECT] [HAND_MODE] [ALIGN_HAND]}"
 # Resolve to an ABSOLUTE path up front: later stages `cd "$SCRIPTS_DIR"` and into the
 # module dirs, so a RELATIVE VIDEO_PATH would stop resolving (run_sam3_video.py would
 # then load 0 frames and crash with `IndexError: list index out of range`). This also
@@ -25,7 +25,28 @@ VIDEO_PATH="${1:?usage: run_pipeline.sh VIDEO_PATH [FRAME_N] [OBJECT] [ANCHOR_HA
 VIDEO_PATH="$(realpath "$VIDEO_PATH")"
 n="${2:-28}"
 OBJECT_NAMES=("${3:-pan}")
-ANCHOR_HAND="${4:-right}"
+HAND_MODE="${4:-right}"
+ALIGN_HAND="${5:-right}"
+
+# Bimanual Support
+case "$HAND_MODE" in
+    left|right)
+        ALIGN_HAND="$HAND_MODE"
+        ;;
+    bimanual)
+        if [[ "$ALIGN_HAND" != "left" && "$ALIGN_HAND" != "right" ]]; then
+            echo "ERROR: ALIGN_HAND must be left or right for bimanual mode."
+            exit 1
+        fi
+        ;;
+    *)
+        echo "ERROR: HAND_MODE must be left, right, or bimanual."
+        exit 1
+        ;;
+esac
+
+echo "HAND_MODE=$HAND_MODE"
+echo "ALIGN_HAND=$ALIGN_HAND"
 
 # ──────────────────────────── Derived paths ────────────────────────────
 VIDEO_DIR="$(dirname "$VIDEO_PATH")"
@@ -53,13 +74,29 @@ ffmpeg -i "$VIDEO_PATH" -vsync 0 -start_number 0 "$VIDEO_DIR/all_frames/%06d.png
 echo "=== Saving config and extracting reference frame ==="
 OBJ_ARRAY=$(printf ', "%s"' "${OBJECT_NAMES[@]}")
 OBJ_ARRAY="[${OBJ_ARRAY:2}]"
-cat > "$VIDEO_DIR/config.json" <<EOF
+
+# ------------ Config.json 수정 ---------------
+# hand_mode : one hand인지 two hand인지 표시
+# anchor_hand : Object-Hand의 Scale/Translation 정렬 기준
+
+if [[ "$HAND_MODE" == "bimanual" ]]; then
+    # Retargeting의 process_dataset.py는 anchor_hand가 없을 때
+    # embodiment_type을 bimanual로 판단한다.
+    cat > "$VIDEO_DIR/config.json" <<EOF
+{
+    "frame_number": $n,
+    "object_names": $OBJ_ARRAY
+}
+EOF
+else
+    cat > "$VIDEO_DIR/config.json" <<EOF
 {
     "frame_number": $n,
     "object_names": $OBJ_ARRAY,
-    "anchor_hand": "$ANCHOR_HAND"
+    "anchor_hand": "$HAND_MODE"
 }
 EOF
+fi
 
 ffmpeg -y -i "$VIDEO_PATH" -vf "select=eq(n\,${n})" -vsync 0 -vframes 1 "$FRAME_PATH"
 
@@ -76,14 +113,36 @@ for OBJ_NAME in "${OBJECT_NAMES[@]}"; do
         --frame_idx "$n"
 done
 
+# SAM3 hand segmentation 부분 수정
+
 echo "=== Running SAM3 video segmentation (hands, text-based) ==="
-HAND_NAME="$ANCHOR_HAND hand"
-HAND_ID="${ANCHOR_HAND}_hand_0"
-python run_sam3_video.py \
-    --video "$VIDEO_PATH" \
-    --text "$HAND_NAME" \
-    --obj_id "$HAND_ID" \
-    --frame_idx "$n"
+
+segment_hand() {
+    local SIDE="$1"
+    local HAND_NAME="${SIDE} hand"
+    local HAND_ID="${SIDE}_hand_0"
+
+    echo "Segmenting ${SIDE} hand: ${HAND_ID}"
+
+    python run_sam3_video.py \
+        --video "$VIDEO_PATH" \
+        --text "$HAND_NAME" \
+        --obj_id "$HAND_ID" \
+        --frame_idx "$n"
+}
+
+case "$HAND_MODE" in
+    left)
+        segment_hand left
+        ;;
+    right)
+        segment_hand right
+        ;;
+    bimanual)
+        segment_hand left
+        segment_hand right
+        ;;
+esac
 
 # ──────────────── Step 2: 3D reconstruction, pointmaps, HaWoR ────────
 echo "=== Running batch masks to meshes ==="
@@ -183,11 +242,14 @@ for OBJ_NAME in "${OBJECT_NAMES[@]}"; do
     LAYOUT_JSON_OPT="$VIDEO_DIR/obj_tracking_out/$OBJECT_ID/combined_visualization/layout_camera_frame_optimized.json"
 
     echo "=== Optimizing translation/scale for $OBJ_NAME ==="
+    
+    # 최적화 수정코드
+    
     python optimize_translation_scale.py \
-        --video-dir "$VIDEO_DIR" \
-        --layout-json "$LAYOUT_JSON_CF" \
-        --anchor-hand "$ANCHOR_HAND" \
-        --ref-frame "$n"
+    	--video-dir "$VIDEO_DIR" \
+    	--layout-json "$LAYOUT_JSON_CF" \
+    	--anchor-hand "$ALIGN_HAND" \
+    	--ref-frame "$n"
 
     # Optional trajectory smoothing to minimize depth inconsistencies
     # Writes <..._optimized>_smooth.json; point visualize_3d.py at it below to use.

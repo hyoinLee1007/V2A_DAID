@@ -121,6 +121,16 @@ class Config:
     warmup_ref_finger_interp_duration: float = 0.0  # seconds to interpolate finger ref from init to frame 0 (0 = disabled)
     warmup_ref_finger_interp_steps: int = 0  # derived from warmup_ref_finger_interp_duration / sim_dt
     warmup_min_clearance: float = 0.0  # extra distance added past the first penetration-free init pose (meters, 0 = disabled)
+    warmup_floor_margin: float = 0.01  # analytical init keeps the wrist at least this far above the floor (meters); matters when hand_floor_collision is off, so nothing else enforces it
+    warmup_backoff_trigger_dist: float = 0.0  # only apply the analytical backoff when the robot hand comes within this distance (meters) of the object at the reference pose; 0 = no gate (always apply). See warmup_backoff_gate.py
+    # Seconds over which the warmup wrist back-off is faded out AFTER warmup,
+    # instead of being dropped at the boundary. Measured on cupmove without it:
+    # the reference wrist jumps 191.4 mm in one step at the warmup boundary,
+    # the hand (1.6 mm/step) ends warmup 152 mm behind, and the grasp happens
+    # during the catch-up with the wrist centimetres off. 0 = old behaviour.
+    warmup_offset_decay_duration: float = 0.0
+    warmup_offset_decay_steps: int = 0  # derived from warmup_offset_decay_duration / sim_dt
+    warmup_backoff_mode: str = "centroid"  # "centroid" = push hand along object->hand centroid direction; "heatmap" = push along object->handle direction from contact_heatmap_path (see warmup_backoff_direction.py), falling back to centroid on failure
 
     # === OPTIMIZER CONFIGURATION ===
     # Sampling parameters
@@ -158,10 +168,67 @@ class Config:
     vel_rew_scale: float = 0.0001
     terminal_rew_scale: float = 1.0
     contact_rew_scale: float = 0.0
+    # Heatmap-guided contact term: pulls the 5 fingertip sites toward
+    # high-confidence regions of a per-object contact_heatmap.npz (e.g. a cup
+    # handle), rather than tracking the (possibly mis-reconstructed) reference
+    # hand pose. See mjwp.get_reward and build_contact_heatmap_cache.
+    contact_region_skip_warmup: bool = False  # when True the heatmap contact term is inactive during warmup, so warmup follows the interpolated reference instead of being pulled to the object early (matters at large contact_region_rew_scale)
+    contact_region_rew_scale: float = 0.0  # lambda_c
+    contact_region_alpha: float = 0.01  # alpha: heatmap-confidence weight (m^2 units, see get_reward)
+    contact_heatmap_path: str = ""  # absolute path to contact_heatmap.npz; set from task_info.json
+    contact_region_max_points: int = 2000  # cap on heatmap candidate points (highest-confidence kept)
+    # Robot-skin contact term: see retargeting/utils/robot_contact_reward.py.
+    # Scores the patches of the robot's own hand the demonstration used, which
+    # the fingertip-site term above cannot do — it sees only 5 tips (55% of the
+    # demonstrated contact is on phalanges with no site) and cannot tell a
+    # finger's pad from its back (both touch the same object vertices when the
+    # finger is hooked through a handle). Both scales must be > 0: the repel
+    # half alone is escapable by simply not touching the object, which is what
+    # the earlier palm_side_contact.py attempt actually did.
+    # Ray-depth correction applied to the raw hand track before the reference
+    # is built. See retargeting/utils/ray_depth_correction.py. Empty = off, and
+    # the reference is then built from the reconstruction as-is.
+    ray_depth_path: str = ""  # npz from reconstruction/oracle_ray_depth.py
+    robot_contact_map_path: str = ""  # npz from build_robot_contact_map.py
+    robot_contact_attract_scale: float = 0.0  # pulls mapped skin points to the heatmap region
+    robot_contact_repel_scale: float = 0.0  # penalizes contact away from mapped points
+    robot_contact_alpha: float = 0.05  # heatmap-confidence weight, in METRES: the attract cost is a distance, not a squared distance (see robot_contact_reward.py), so this is directly the trade-off radius between "closer" and "higher confidence"
+    robot_contact_max_points: int = 64  # cap on mapped skin points (heaviest kept)
+    # Send each skin point to the object vertices it actually met in the
+    # demonstration, instead of to the nearest touched vertex, and average over
+    # the points instead of summing. Needs a map rebuilt by
+    # build_robot_contact_map.py from a contact map that carries anchor pairs.
+    # Changes the term's magnitude by ~1/42 (the weight sum), so
+    # robot_contact_attract_scale must be reset when this is turned on:
+    # measured on cupmove, scale 6.0 puts it just above qpos_rew.
+    robot_contact_paired: bool = False
+    # npz from resolve_reference_penetration.py, replacing the tracked reference
+    # with one that stays inside penetration_margin. The retargeted reference
+    # buries the hand 11.0 mm into the object (18.0 mm worst, over the margin in
+    # 75% of steps) because the robot's links are thicker than the MANO fingers
+    # they replace; physics cannot follow it, so the optimizer backs off and
+    # contacts with the back of the finger instead. Empty = use the reference as
+    # retargeted.
+    reference_depenetrate_path: str = ""
+    # Attract cost precomputed as a field in the object's frame; see
+    # contact_cost_grid.py. 0 falls back to the exact pairwise minimum, which
+    # is ~100x slower and what the grid is validated against.
+    robot_contact_grid_res: int = 256  # cells per axis; 256 -> 1.8 mm cells, 67 MB
+    # Metres past the object's bbox. Trades reach against cell size at fixed
+    # memory. 0.10 left 12% of queries outside, where the extrapolation is only
+    # a bound and errs by millimetres; 0.20 drops that to 0.1%.
+    robot_contact_grid_margin: float = 0.20
+    robot_contact_skip_warmup: bool = True  # inactive during warmup, as contact_region_skip_warmup
     penetration_penalty_scale: float = 0.0  # penalty per meter of max penetration depth
     penetration_margin: float = 0.003  # allow this much penetration (meters) before penalty kicks in
     drop_penalty_scale: float = 0.0  # penalty when object z falls below drop_z_thresh
     drop_z_thresh: float = 0.0  # z height below which drop penalty activates
+    # Wrist-floor penalty: see retargeting/utils/wrist_floor_penalty.py.
+    # Soft deterrent for the wrist dipping below the floor during control-
+    # tracking transients (e.g. around warmup end), since hand_floor_collision
+    # is off for do_as_i_do and nothing physical stops it.
+    wrist_floor_penalty_scale: float = 0.0
+    wrist_floor_margin: float = 0.01
     # Penalty for object/pedestal contact mismatching the per-frame in-hand gate
     # (same gate used by random perturbation). On frames where the object is
     # supposed to be in-hand, penalize any pedestal contact; on frames where it
@@ -482,6 +549,9 @@ def compute_steps(config: Config):
     )
     config.warmup_ref_finger_interp_steps = int(
         np.round(config.warmup_ref_finger_interp_duration / config.sim_dt)
+    )
+    config.warmup_offset_decay_steps = int(
+        np.round(config.warmup_offset_decay_duration / config.sim_dt)
     )
     config.perturb_gate_lag_steps = int(
         np.round(config.perturb_gate_lag_duration / config.sim_dt)

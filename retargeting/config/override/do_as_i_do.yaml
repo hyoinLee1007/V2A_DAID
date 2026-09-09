@@ -14,13 +14,84 @@ ref_dt: 0.0333  # raw hand tracks (HaWoR) are ~30 FPS
 
 pos_rew_scale: 1.0
 rot_rew_scale: 0.3
-base_pos_rew_scale: 0.1
-base_rot_rew_scale: 0.03
-joint_rew_scale: 0.01
+# Raised 50x from 0.01. Measured on run G: the wrist term was 0.000043, i.e.
+# 0.14% of qpos_rew, while the executed wrist sits 38 mm from the nearest IK
+# reference frame even under the best possible time alignment. At 0.5 it is
+# ~7% of qpos_rew. Which finger reaches the handle is decided by where the
+# wrist is, so leaving it effectively unweighted lets the grasp migrate — run G
+# ended up holding the cup with the pinky (96 of 106 contacts).
+base_pos_rew_scale: 0.5
+base_rot_rew_scale: 0.1
+# Measured on run F: the fingers sit 0.563 rad from the IK reference and the
+# wrist 4.98 cm from it, yet at 0.001 those cost 0.0006 against an obj_pos of
+# 0.075 — the reference the retargeting worked to build is effectively unweighted.
+# 0.05 puts the finger term at ~0.028, level with obj_rot. The reference already
+# has the middle finger right (0.92 cm from its targets, 15.6 points within 2 cm,
+# against 7.00 cm / 0 points in the optimized run), so making it worth following
+# is the cheapest route to that grasp.
+joint_rew_scale: 0.05
 terminal_rew_scale: 10.0
 penetration_penalty_scale: 3000.0
 penetration_margin: 0.005
 pedestal_penalty_scale: 0.5
+wrist_floor_penalty_scale: 3000.0
+wrist_floor_margin: 0.01
+# The fingertip-site contact term is off: the robot-skin term below subsumes it
+# (same object heatmap, but scored against the patches of hand the demo used
+# rather than 5 tips), and running both would pull the tips twice.
+contact_region_rew_scale: 0.0
+contact_region_skip_warmup: true
+contact_region_alpha: 0.01
+contact_heatmap_path: /home/intern/do-as-i-do/reconstruction/heatmap_out/contact_heatmap_palmar.npz
+
+# Robot-skin contact term. The attract cost is a distance, not a squared one,
+# so scale 15 would be ~10-30x the old magnitude for the same geometry; 3 keeps
+# it in the range the rest of the reward lives in while giving a real gradient
+# all the way to contact, which the squared form did not (2 cm scored within 4%
+# of touching, and the optimizer duly let go of the cup).
+# Ray-depth correction applied to the raw hand track, so the IK reference is
+# built from a hand that is where it actually was. Without it the reference
+# itself carries 36% back-of-hand contact and the terms below have to argue
+# against it rather than refine it.
+ray_depth_path: /home/intern/do-as-i-do/reconstruction/heatmap_out/oracle_zstar_cupmove.npz
+
+robot_contact_map_path: /home/intern/do-as-i-do/retargeting/outputs/robot_contact_map_left.npz
+# Scale set from a measurement, not a guess. With robot_contact_paired the
+# term is a weighted *mean* over the skin points, so it reads in metres of
+# mean point-to-target distance. Measured over run E's post-warmup states that
+# mean is 6.73 cm and over the IK reference 1.88 cm, so 5.0 puts attract at
+# 0.336 against qpos_rew 0.290 (1.16x) while the reference itself scores 0.094.
+# The old summed form was 8.53 against the same 0.290 — a 29x overweight that
+# came from summing 64 points whose weights add to 42.13, and it is why the
+# optimizer walked away from a reference that was 83% palm-side.
+# 5.0 gave attract 0.377 against qpos_rew 0.087 — still 4.3:1, because tracking
+# improved and the denominator moved with it. 1.5 puts it at ~0.11 against a
+# qpos_rew of ~0.10 once joint_rew_scale below is raised.
+# 5.0 dominated (4.3:1 over qpos_rew); 1.5 hit the 1.3:1 target but was too
+# weak to hold the grasp on the demonstrated patches — only 6% of contacts
+# landed within 2 cm of a demonstrated point, against 100% at 5.0. 3.0 splits
+# the two.
+robot_contact_attract_scale: 3.0
+# Measured, not assumed: one dorsal contact is 4.47 mm of palmar depth (not the
+# 7.5 mm guessed), and the executed trajectory carries 2.72 mm/step summed. At
+# scale 10 that is 0.027 on the executed path but only 0.0037 as logged over the
+# sample cloud, i.e. the samplers see dorsal contact ~7x less often than the
+# final trajectory does. Raising this further is bounded by the escape
+# arithmetic — letting go raises attract by ~0.12 — so the dorsal face is not
+# fixable from this term alone; it is left as a mild deterrent.
+robot_contact_repel_scale: 10.0
+robot_contact_alpha: 0.05   # metres now, not m^2 — the cost is linear in distance
+robot_contact_paired: true
+# Full 1846-step reference, corrected with the palmar term (mu=1). Measured:
+# penetration 8.95 -> 3.12 mm mean and 17.99 -> 7.76 mm max, while the palm-side
+# share goes 84.0% -> 87.1% and the middle finger 23% -> 10% dorsal, i.e. the
+# corrected reference is both reachable under physics and *more* palm-side than
+# the one retargeting produced. Without the palmar term the same correction sent
+# middle to 48% and ring to 67% dorsal, and the optimized grasp moved onto the
+# pinky's knuckles.
+reference_depenetrate_path: /home/intern/do-as-i-do/retargeting/outputs/reference_depen_palmar.npz
+robot_contact_max_points: 64
+robot_contact_skip_warmup: true
 
 knot_dt: 0.2
 pos_noise_scale: 0.01
@@ -32,7 +103,14 @@ first_ctrl_noise_scale: 1.0
 last_ctrl_noise_scale: 4.0
 
 warmup_duration: 3.0
-warmup_min_clearance: 0.1
+warmup_min_clearance: 0.2
+warmup_backoff_trigger_dist: 0.1
+warmup_backoff_mode: centroid
+# The back-off is held for the whole warmup and then simply dropped, so the
+# reference wrist jumps 191.4 mm in the single step from 599 to 600 — the hand
+# moves 1.6 mm/step and ends warmup 152 mm behind. 1.0 s = 200 steps fades it
+# out under free dynamics instead, at ~1.0 mm/step.
+warmup_offset_decay_duration: 1.0
 warmup_ref_base_interp_duration: 3.0
 warmup_ref_finger_interp_duration: 3.0
 warmup_ramp_duration: 0.0

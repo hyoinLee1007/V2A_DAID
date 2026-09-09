@@ -42,7 +42,7 @@ else:
     _sample_ctrls_compiled = _sample_ctrls_impl
 
 
-def sample_ctrls(
+def sample_ctrls( # TODO 노이즈 주입
     config, ctrls: torch.Tensor, sample_params: dict | None = None
 ) -> torch.Tensor:
     """Sample (num_samples, horizon, nu) ctrls from (horizon, nu) reference."""
@@ -240,9 +240,10 @@ def make_optimize_once_fn(
         """One DIAL-MPC optimization step (no annealing)."""
         ctrls_samples = sample_ctrls(config, ctrls, sample_params)
 
-        # Domain randomization: worst-case (min) reward across all DR parameter sets.
+        # Optimize_once안에서 노이즈 섞은 후보(ctrls_sample)를 실제로 평가하고 가중치를 매기는 부분
         min_rew = torch.full((config.num_samples,), float("inf"), device=config.device)
-        for env_param in env_params:
+        for env_param in env_params: # 여러개의 DR 파라미터 set에 대해
+            # 각 Set에서 rollout -> 후보별 보상
             ctrls_samples, rews, rollout_info = rollout(
                 config,
                 env,
@@ -251,14 +252,14 @@ def make_optimize_once_fn(
                 env_param,
             )
             min_rew = torch.minimum(min_rew, rews)
-        rews = min_rew
+        rews = min_rew # DR세트 중 최악의 경우만 남김
 
         if config.use_torch_compile:
             weights, nan_mask = _compute_weights_compiled(
                 rews, config.num_samples, config.temperature
             )
         else:
-            weights, nan_mask = _compute_weights_impl(
+            weights, nan_mask = _compute_weights_impl( # 상위 10% + softmax 가중치
                 rews, config.num_samples, config.temperature
             )
         if nan_mask.any():
@@ -266,7 +267,7 @@ def make_optimize_once_fn(
                 f"NaNs or infs in rews: {nan_mask.sum()}/{config.num_samples}"
             )
 
-        ctrls_mean = (weights[:, None, None] * ctrls_samples).sum(dim=0)
+        ctrls_mean = (weights[:, None, None] * ctrls_samples).sum(dim=0) # 가중평균 = 이번 라운드 결과 
 
         # Downsample traces (topk + uniform samples) for visualization.
         n_uni = max(0, min(config.num_trace_uniform_samples, config.num_samples))

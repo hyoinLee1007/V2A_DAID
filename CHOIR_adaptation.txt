@@ -1,0 +1,7 @@
+1.reconstruction/dataset/cupmove/ 안에서 CHOIR에게 전달하기 위해서 원시 재구성 출력(카메라프레임)를 전달
+1) 프레임별 MANO 파라미터
+2) 물체 mesh
+3) 물체 6D pose
+4) 카메라 내부 파라미터
+=> CHOIR은 카메라 ray 기준 depth를 보정하므로 중력 정렬전의 카메라 프레임 데이터가 필요
+중력전의 카메라 프레임 data = all_hand_meshes.npz

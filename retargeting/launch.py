@@ -5,11 +5,13 @@ Usage: python launch.py --task whisking --raw-dir ../reconstruction/whisking
 
 from __future__ import annotations
 
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import loguru
+import numpy as np
 import tyro
 
 from retargeting.config import Config, filter_config_fields, load_config_yaml
@@ -38,7 +40,18 @@ class PipelineConfig:
     task: str = ""
     hand_type: str = "auto"
     data_id: int = 0
+    # Drop the first N demo frames so frame 0 is a tracked pre-grasp pose.
+    # warmup_analytical_init assumes frame 0 is a grasp-like pose whose palm
+    # normal points at the object; a demo that opens with the hand resting on
+    # the table within warmup_min_clearance of the object breaks that
+    # assumption (the hand gets backed off in a bad direction and the grasp
+    # collapses onto the object body — see cupmove).
+    start_idx: int = 0
     dataset_name: str = "do_as_i_do"
+    # Ray-depth correction for the raw hand track, applied in process_dataset
+    # before the reference is built. See utils/ray_depth_correction.py. Empty
+    # leaves the reconstruction as-is.
+    ray_depth_path: str = ""
     robot_type: str = "sharpa"
     seed: int = 0
     wait_on_finish: bool = True
@@ -79,6 +92,16 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     if not cfg.task:
         raise ValueError("--task is required (the video name, e.g. whisking)")
 
+    # The dataset override YAML is otherwise read at Stage 4.5, long after the
+    # reference has been built. The ray-depth correction has to be applied
+    # while the raw track is being loaded, so pick that one setting up early —
+    # a CLI --ray-depth-path still wins.
+    if not cfg.ray_depth_path:
+        override_path = CONFIG_DIR / "override" / f"{cfg.dataset_name}.yaml"
+        if override_path.exists():
+            cfg.ray_depth_path = load_config_yaml(str(override_path)).get(
+                "ray_depth_path", "")
+
     # Stage 1: dataset processing
     pipeline_task = process_dataset(
         raw_dir=cfg.raw_dir,
@@ -88,10 +111,45 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         embodiment_type=cfg.hand_type,
         dataset_name=cfg.dataset_name,
         force=cfg.force,
+        ray_depth_path=cfg.ray_depth_path,
     )
     if pipeline_task is None:
         loguru.logger.error(f"{cfg.dataset_name} processing failed (no task_name returned)")
         sys.exit(1)
+
+    # Optional trim: slice the MANO keypoints NPZ so every downstream consumer
+    # (solve_ik's reference AND optimize_physics' in-hand gate masks) sees the
+    # same shifted timeline. Trimming only the IK via solve_ik(start_idx=...)
+    # would desynchronize the gates, so the data itself is cut here.
+    if cfg.start_idx > 0:
+        from retargeting.utils.io import get_processed_data_dir, resolve_auto_embodiment
+
+        emb = cfg.hand_type
+        if emb == "auto":
+            emb = resolve_auto_embodiment(cfg.dataset_name, cfg.output_root_dir, pipeline_task)
+        mano_npz = os.path.join(
+            get_processed_data_dir(cfg.output_root_dir, cfg.dataset_name, "mano", emb, pipeline_task, cfg.data_id),
+            "trajectory_keypoints.npz",
+        )
+        data = dict(np.load(mano_npz))
+        if "trim_start_idx" in data:
+            loguru.logger.warning(
+                "MANO data already trimmed (start_idx={}); skipping re-trim. "
+                "Re-run with --force to regenerate from raw first.",
+                int(data["trim_start_idx"]),
+            )
+        else:
+            wl, wr = data["qpos_wrist_left"], data["qpos_wrist_right"]
+            n_frames = wl.shape[0] if wl.size else wr.shape[0]
+            for k, a in data.items():
+                if a.ndim >= 1 and a.shape[0] == n_frames:
+                    data[k] = a[cfg.start_idx:]
+            data["trim_start_idx"] = np.array(cfg.start_idx)
+            np.savez(mano_npz, **data)
+            loguru.logger.info(
+                "Trimmed first {} frames from {} ({} -> {} frames).",
+                cfg.start_idx, mano_npz, n_frames, n_frames - cfg.start_idx,
+            )
 
     # Stage 2: convex decomposition
     decompose_mesh(
@@ -162,6 +220,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         use_support=USE_SUPPORT,
         hand_object_distance_thresh=config.hand_object_distance_thresh,
         force=cfg.force,
+        force_pedestal_start=config.warmup_min_clearance > 0.0,
     )
 
     # Stage 5: physics optimization (MuJoCo Warp)

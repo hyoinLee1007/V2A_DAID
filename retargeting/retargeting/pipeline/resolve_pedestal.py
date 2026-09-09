@@ -453,12 +453,23 @@ def resolve_scene_pedestal(
     hand_object_distance_thresh: float = DEFAULT_DISTANCE_THRESH,
     act_scene: bool = False,
     force: bool = False,
+    force_pedestal_start: bool = False,
 ) -> None:
     """Resolve ``scene_ik.xml`` → ``scene.xml`` (+ eq/act variants).
 
     Runs the in-hand endpoint check against the raw keypoint reference and places
     pedestals using the IK-output object pose. With ``use_pedestal=False`` (or no
     endpoint needing stabilization) the outputs are copies of the structural input.
+
+    ``force_pedestal_start``: treat the start (frame 0) endpoint as not-in-hand
+    even if the raw reference's hand-object distance says otherwise. Needed
+    when the physics optimizer's warmup deliberately backs the hand off the
+    reference pose (``Config.warmup_min_clearance > 0``): the in-hand check
+    here only sees the *raw* reconstructed reference, so a demo that starts
+    with the hand already resting on/near the object (in_hand=True, no
+    pedestal placed) leaves the object with nothing to rest on once warmup
+    ends and gravity turns on but the optimizer's hand is still deliberately
+    separated from it.
     """
     output_root_dir = os.path.abspath(output_root_dir)
     if embodiment_type == "auto":
@@ -554,6 +565,15 @@ def resolve_scene_pedestal(
                     f"{hand_object_distance_thresh:.4f}m [{pass_fail}]) → "
                     + ("stabilize (add pedestal)" if not in_hand else "skip (no pedestal)")
                 )
+                if ep_name == "start" and force_pedestal_start and in_hand:
+                    loguru.logger.info(
+                        f"{side} object (start): overridden to not-in-hand — "
+                        "warmup backs the hand off the reference pose "
+                        "(force_pedestal_start=True), so the object needs a "
+                        "physical rest surface once warmup ends regardless of "
+                        "the raw reference's hand-object distance."
+                    )
+                    in_hand = False
                 if in_hand:
                     continue
                 # Place using actual IK-output pose at this endpoint.
@@ -651,6 +671,7 @@ def main(
     hand_object_distance_thresh: float = DEFAULT_DISTANCE_THRESH,
     act_scene: bool = False,
     force: bool = False,
+    force_pedestal_start: bool = False,
 ):
     resolve_scene_pedestal(
         output_root_dir=output_root_dir,
@@ -668,4 +689,5 @@ def main(
         hand_object_distance_thresh=hand_object_distance_thresh,
         act_scene=act_scene,
         force=force,
+        force_pedestal_start=force_pedestal_start,
     )

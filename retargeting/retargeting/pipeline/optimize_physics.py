@@ -29,6 +29,7 @@ from retargeting.utils.sampling import (
     make_rollout_fn,
 )
 from retargeting.utils.tracking_error import compute_object_tracking_error
+from retargeting.utils.warmup_target_offset import shift_target_position
 from retargeting.utils.mjwp import (
     check_penetration,
     compute_contact_point_delta,
@@ -263,12 +264,19 @@ def main(config: Config):
             config, env, qpos_ref[0], ctrl_ref[0],
             finger_qpos_indices,
         )
+        
+    # TODO : 초기값에 따른 물체와 손 사이의 거리 떨어뜨리기
 
     # Interpolate reference from the actual init pose (after analytical placement)
     # to the closed-grasp frame 0. Wrist (base) and finger DOFs can have
     # different interpolation durations to prevent targeting a penetrating
     # reference when the hand is still far from the object. Object dims are
     # never interpolated — they stay at frame 0 throughout warmup.
+    # Row 0 BEFORE the interpolation below overwrites it with the backed-off
+    # pose. The warmup offset is (this - selected_qpos), and reading qpos_ref[0]
+    # after the overwrite yields ~0 instead of the real 191.4 mm back-off.
+    _ref0_qpos_pre = qpos_ref[0].detach().cpu().numpy().copy()
+    _ref0_ctrl_pre = ctrl_ref[0].detach().cpu().numpy().copy()
     base_interp_n = min(config.warmup_ref_base_interp_steps, config.warmup_steps) if config.warmup_ref_base_interp_steps > 0 else 0
     finger_interp_n = min(config.warmup_ref_finger_interp_steps, config.warmup_steps) if config.warmup_ref_finger_interp_steps > 0 else 0
     if (base_interp_n > 0 or finger_interp_n > 0) and config.warmup_steps > 0:
@@ -287,6 +295,18 @@ def main(config: Config):
         if base_interp_n > 0 and len(base_qpos_idx) > 0:
             base_target_qpos = qpos_ref[base_interp_n].detach().cpu().numpy()
             base_target_ctrl = ctrl_ref[base_interp_n].detach().cpu().numpy()
+            # Keep the interpolation target as separated from the object as
+            # `selected_qpos` already is, instead of collapsing back to the
+            # raw (near-touching) reference pose exactly when warmup ends —
+            # see warmup_target_offset.py.
+            qpos_ref_0_np = qpos_ref[0].detach().cpu().numpy()
+            ctrl_ref_0_np = ctrl_ref[0].detach().cpu().numpy()
+            base_target_qpos = shift_target_position(
+                config, base_target_qpos, qpos_ref_0_np, selected_qpos
+            )
+            base_target_ctrl = shift_target_position(
+                config, base_target_ctrl, ctrl_ref_0_np, selected_ctrl
+            )
             base_qpos = warmup_ref_interp(selected_qpos, base_target_qpos, base_interp_n)
             base_ctrl = warmup_ref_interp(selected_ctrl, base_target_ctrl, base_interp_n)
             interped_qpos[:base_interp_n, base_qpos_idx] = base_qpos[:, base_qpos_idx]
@@ -305,6 +325,56 @@ def main(config: Config):
             base_interp_n, base_interp_n * config.sim_dt,
             finger_interp_n, finger_interp_n * config.sim_dt,
         )
+
+    # Swap in a de-penetrated reference, if one was precomputed. The retargeted
+    # reference buries the hand in the object by 11.0 mm on average and 18.0 mm
+    # at worst — past penetration_margin in 75% of steps — because the robot's
+    # links are thicker than the MANO fingers they stand in for. Physics cannot
+    # reproduce that, so the optimizer backs off, and backing off from a buried
+    # pad puts the *back* of the finger on the object. See
+    # resolve_reference_penetration.py, which produces this file.
+    # Keep the pre-correction reference so one run yields both: the corrected
+    # one that was tracked, and the raw one the next correction pass needs as
+    # input. Without this the raw reference is unrecoverable once a correction
+    # is enabled, and the correction can only ever be recomputed from a run
+    # that had it switched off.
+    qpos_ref_raw = qpos_ref.detach().clone()
+    if config.reference_depenetrate_path:
+        try:
+            _dp = np.load(config.reference_depenetrate_path)["qpos_ref"]
+            _n = min(len(_dp), qpos_ref.shape[0])
+            if _dp.shape[1] != qpos_ref.shape[1]:
+                raise ValueError(
+                    f"{_dp.shape[1]} qpos dims, reference has {qpos_ref.shape[1]}")
+            qpos_ref[:_n] = torch.from_numpy(_dp[:_n]).to(qpos_ref)
+            loguru.logger.info(
+                "Reference de-penetration applied over {} of {} steps from {}",
+                _n, qpos_ref.shape[0], config.reference_depenetrate_path)
+        except (OSError, KeyError, ValueError) as exc:
+            loguru.logger.warning(
+                "Could not apply reference de-penetration from {} ({}); "
+                "using the reference as retargeted.",
+                config.reference_depenetrate_path, exc)
+
+    # Fade the warmup wrist back-off out over the first steps of free dynamics,
+    # so the reference carries an approach the hand can track instead of a
+    # 191.4 mm single-step teleport at the warmup boundary. Runs after the
+    # interpolation block, which is what applied the offset in the first place.
+    if config.warmup_offset_decay_steps > 0 and config.warmup_steps > 0:
+        try:
+            from retargeting.utils.warmup_offset_decay import apply_offset_decay
+            _sel_q = wp.to_torch(env.data_wp.qpos)[0].detach().cpu().numpy()
+            _sel_c = wp.to_torch(env.data_wp.ctrl)[0].detach().cpu().numpy()
+            _n = apply_offset_decay(
+                config, qpos_ref, ctrl_ref,
+                _ref0_qpos_pre, _sel_q, _ref0_ctrl_pre, _sel_c)
+            loguru.logger.info(
+                "Warmup offset decay: faded the wrist back-off over {} steps "
+                "({:.2f}s) after warmup.", _n, _n * config.sim_dt)
+        except Exception as exc:  # never allowed to break the run
+            loguru.logger.warning(
+                "Warmup offset decay failed ({}); reference left as-is.", exc)
+
 
     # setup mujoco (for viewer only)
     mj_model = setup_mj_model(config)
@@ -726,6 +796,20 @@ def main(config: Config):
         info_aggregated = {}
         for k in info_list[0].keys():
             info_aggregated[k] = np.stack([info[k] for info in info_list], axis=0)
+        # The reference the optimizer actually tracked, step-for-step with the
+        # executed qpos. Neither trajectory_kinematic.npz nor
+        # trajectory_ikrollout.npz is this: both are the raw 78-frame IK output,
+        # while this has been resampled to sim_dt and had its warmup segment
+        # re-anchored to the analytically placed init pose (see the interpolation
+        # block above). Measured on run G, the wrist sat 4.3 mm from this and
+        # 38 mm from the nearest kinematic frame, so tuning against the saved
+        # IK files was tuning against the wrong signal.
+        # The WHOLE reference, not just the executed span. Truncating it to the
+        # executed length (1200 of 1846 steps) meant a correction computed from
+        # this file covered only 65% of the trajectory and the tail silently
+        # kept the uncorrected reference.
+        info_aggregated["qpos_ref"] = qpos_ref.detach().cpu().numpy()
+        info_aggregated["qpos_ref_raw"] = qpos_ref_raw.cpu().numpy()
         np.savez(
             f"{config.output_dir}/trajectory_mjwp{'_act' if config.contact_guidance else ''}.npz",
             **info_aggregated,
