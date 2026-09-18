@@ -332,8 +332,21 @@ def main():
         hi = min(fidx, n_hand_frames - 1)
         anchor_verts_ref = hand_data[f'{anchor}_vertices'][hi]
         hand_mask = load_mask(args.mask_dir, fidx, f"{anchor}_hand_0")
-        if hand_mask is None:
-            print(f"[error] ref frame hand mask not found")
+        if hand_mask is None or not hand_mask.any():
+            # SAM3 writes an all-zero mask on frames where it lost the object,
+            # so an existing file is not evidence of a hand. Without this the
+            # failure surfaces two steps later as "too few hand raycast hits (0)".
+            why = "not found" if hand_mask is None else "empty (0 px)"
+            print(f"[error] ref frame {fidx}: {anchor}_hand_0 mask is {why}")
+            usable = []
+            for fr in frames:
+                m = load_mask(args.mask_dir, fr["frame_idx"], f"{anchor}_hand_0")
+                if m is not None and m.any():
+                    usable.append(fr["frame_idx"])
+            if usable:
+                near = sorted(usable, key=lambda f: abs(f - fidx))[:3]
+                print(f"        frames with a non-empty hand mask nearest to it: {near}"
+                      f" — pass one with --ref-frame")
             sys.exit(1)
         if hand_mask.shape != (pm_h, pm_w):
             hand_mask = cv2.resize(hand_mask.astype(np.uint8), (pm_w, pm_h),
@@ -430,8 +443,12 @@ def main():
         # Hand mask, resized to pointmap resolution
         hand_mask_name = f"{anchor}_hand_0"
         hand_mask = load_mask(args.mask_dir, fidx, hand_mask_name)
-        if hand_mask is None:
-            print(f"  frame {fidx:3d}: hand mask missing, skipping (frame keeps ref-scaled translation)")
+        if hand_mask is None or not hand_mask.any():
+            # The translation written for this frame is the raw tracker one,
+            # not a ref-scaled one; process_dataset.py treats frames absent
+            # from per_frame as invalid and interpolates them.
+            why = "missing" if hand_mask is None else "empty"
+            print(f"  frame {fidx:3d}: hand mask {why}, skipping (not in per_frame; interpolated downstream)")
             skipped += 1
             continue
         if hand_mask.shape != (pm_h, pm_w):
@@ -593,6 +610,12 @@ def main():
         "mask_name": args.mask_name,
         "anchor_hand": args.anchor_hand,
         "per_frame": per_frame_scales,
+        # Frames above whose translation_camera_frame was NOT rescaled. They
+        # keep the raw tracker value and must not be used as object poses.
+        "skipped_frames": sorted(
+            {fr["frame_idx"] for fr in frames}
+            - {p["frame_idx"] for p in per_frame_scales}
+        ),
     }
 
     # Write output

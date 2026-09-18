@@ -46,6 +46,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-weight", type=float, default=0.05,
                    help="Drop vertices below this share of the peak count. Keeps "
                         "single stray frames out of the target set.")
+    p.add_argument("--finger-scale", default="",
+                   help="Per-finger weight multipliers, e.g. 'middle=1.97'. The "
+                        "attract term is a weighted mean over the kept points, so "
+                        "a finger with more weight wins when two fingers want "
+                        "poses that conflict. Measured on cupmove: index carried "
+                        "52.1%% of the weight against middle's 37.0%%, and the "
+                        "optimized grasp put index on its pad (77 contacts, 0%% "
+                        "dorsal) while middle went entirely to the back of the "
+                        "finger. This also shifts which points survive the "
+                        "--max-points cut, since that ranks by the same weight.")
     p.add_argument("--out", default="outputs/robot_contact_map_{side}.npz")
     return p.parse_args()
 
@@ -81,7 +91,16 @@ def main() -> None:
     if len(idx) == 0:
         raise SystemExit("no vertices survived; lower --min-weight")
 
-    w = Hh[idx]
+    w = Hh[idx].copy()
+    if args.finger_scale:
+        for part in args.finger_scale.split(","):
+            name, _, factor = part.partition("=")
+            sel = finger[idx] == name.strip()
+            if not sel.any():
+                raise SystemExit(f"--finger-scale: no points on finger {name!r}")
+            w[sel] *= float(factor)
+            print(f"finger-scale: {name.strip()} x{float(factor):.3f} "
+                  f"({int(sel.sum())} points)")
     print(f"MANO vertices in contact : {int((Hh > 0).sum())}")
     print(f"  above min-weight {args.min_weight:<5}: {len(idx)}"
           + (f"   ({flipped} dropped for a flipped side)" if flipped else ""))
@@ -93,7 +112,7 @@ def main() -> None:
         sel = idx[finger[idx] == fg]
         if len(sel) == 0:
             continue
-        sw = Hh[sel].sum()
+        sw = w[finger[idx] == fg].sum()   # scaled weights, i.e. what is saved
         segs = Counter(segment[sel].tolist())
         print(f"{fg:8s} {len(sel):4d} {sw:8.2f} {100 * sw / tot:6.1f}%   "
               + " ".join(f"{k}:{v}" for k, v in sorted(segs.items())))

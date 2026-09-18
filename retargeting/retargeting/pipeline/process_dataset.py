@@ -9,6 +9,7 @@ import glob
 import json
 import os
 import shutil
+import subprocess
 
 import loguru
 import numpy as np
@@ -370,6 +371,60 @@ def _copy_obj_texture(src_obj: str, dst_dir: str) -> str | None:
     return os.path.basename(dst)
 
 
+
+def _source_ref_dt(raw_dir: str) -> float | None:
+    """Seconds per reference frame, measured from the source clip.
+
+    The reference has one entry per extracted video frame, so this is 1/fps.
+    config/override/do_as_i_do.yaml hardcodes 0.0333 for every task, but the
+    clips in dataset/ run at 15, 16, 24, 25, 29.97, 30 and 50 FPS — at 50 the
+    reference is replayed 1.67x too slow and at 16 it is 1.88x too fast, with
+    no error either way. config.py already prefers task_info.json's ref_dt over
+    the YAML; this is what fills it in.
+
+    Returns None when the rate cannot be established, which leaves the key out
+    and the YAML value in force — the previous behaviour.
+    """
+    meta_path = os.path.join(raw_dir, "meta.json")
+    if os.path.exists(meta_path):
+        try:
+            meta = json.load(open(meta_path, encoding="utf-8"))
+            if meta.get("ref_dt"):
+                return float(meta["ref_dt"])
+        except (OSError, ValueError, TypeError):
+            pass  # fall through to ffprobe
+
+    task_name = os.path.basename(os.path.normpath(raw_dir))
+    videos = [os.path.join(raw_dir, f"{task_name}.mp4")]
+    videos += sorted(glob.glob(os.path.join(raw_dir, "*.mp4")))
+    video = next((v for v in videos if os.path.exists(v)), None)
+    if video is None:
+        loguru.logger.warning(
+            "No source video under {}; ref_dt left to the config default.", raw_dir)
+        return None
+
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate", "-of",
+             "default=nw=1:nk=1", video],
+            check=True, capture_output=True, text=True, timeout=30).stdout.strip()
+        num, _, den = out.partition("/")
+        fps = float(num) / float(den or 1)
+    except (OSError, subprocess.SubprocessError, ValueError, ZeroDivisionError) as exc:
+        loguru.logger.warning(
+            "Could not read the frame rate of {} ({}); ref_dt left to the "
+            "config default.", video, exc)
+        return None
+
+    if not 1.0 < fps < 1000.0:
+        loguru.logger.warning(
+            "Implausible frame rate {} from {}; ref_dt left to the config default.",
+            fps, video)
+        return None
+    return 1.0 / fps
+
+
 def main(
     raw_dir: str = "../reconstruction/whisking",
     output_root_dir: str = "outputs",
@@ -530,6 +585,29 @@ def main(
             obj_valid[fi] = True
         else:
             loguru.logger.warning(f"Frame {fi}: object Z={t[2]:.4f} (negative depth) — marking invalid")
+
+    # optimize_translation_scale.py rescales every translation by the ref
+    # frame's pointmap scale and then fits a per-frame scale, but a frame it
+    # skips (empty hand mask, too few raycast hits, ...) is written back with
+    # its *raw* tracker translation — ~4x off in depth on iphone_video, where
+    # the phone then sits 1.8 m from the hand for 42 frames. Those poses have
+    # positive depth, so the check above accepts them, and a 42-frame run is
+    # longer than the spike cleaner's max_burst, so it is kept as real motion.
+    # `per_frame` lists the frames that were actually fitted and survives the
+    # smoothing step, so anything outside it is marked invalid here and
+    # interpolated like any other missing pose.
+    per_frame = (layout.get("translation_scale_optimization") or {}).get("per_frame")
+    if per_frame:
+        fitted = {int(p["frame_idx"]) for p in per_frame}
+        unfitted = np.array([fi for fi in range(N) if obj_valid[fi] and fi not in fitted],
+                            dtype=int)
+        if len(unfitted):
+            obj_valid[unfitted] = False
+            _log_mask(np.isin(np.arange(N), unfitted), "obj_unfitted_scale")
+            loguru.logger.warning(
+                "{} object frames were skipped by translation-scale optimization "
+                "and still carry unscaled translations; marking them invalid so "
+                "they are interpolated.", len(unfitted))
 
     # ------------------------------------------------------------------
     # 2b. Drop the first `start_frame` reference frames.
@@ -961,6 +1039,11 @@ def main(
         "right_object_mesh_dir": mesh_dir_relative if process_right else None,
         "left_object_mesh_dir": mesh_dir_relative if (process_left and not process_right) else None,
     }
+    ref_dt = _source_ref_dt(raw_dir)
+    if ref_dt is not None:
+        task_info["ref_dt"] = round(ref_dt, 6)
+        loguru.logger.info(
+            "Source clip is {:.2f} FPS -> ref_dt {:.4f}", 1.0 / ref_dt, ref_dt)
     task_info_path = f"{task_dir}/task_info.json"
     with open(task_info_path, "w") as f:
         json.dump(task_info, f, indent=2)

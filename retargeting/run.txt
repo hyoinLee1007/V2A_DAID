@@ -13,7 +13,6 @@ mv \
 "$POSE_DIR/layout_camera_frame_optimized.json" \
 "$POSE_DIR/layout_camera_frame_optimized_raw.json"
 
-1-2. smooth 파일을 기대 파일명으로 심볼릭 링크
 ln -s \
 "$POSE_DIR/layout_camera_frame_optimized_smooth.json" \
 "$POSE_DIR/layout_camera_frame_optimized.json"
@@ -35,5 +34,8 @@ python replay_viser.py \
   --run-dir outputs/sharpa/left/cupmove/0 \
   --port 8081
   
+2-2. ray 방향의 depth를 보정한 파일에서 ray depth를 보정한 레퍼런스 궤적
+python replay_viser.py --run-dir outputs/sharpa/left/cupmove_decay2/0     --port 8081 --play-reference
+
 3. Optimization과정에서 목적함수의 cost항 비교 Graph Visualization
 python viz_reward_terms.py   --run-dir outputs/sharpa/left/cupmove/0 --label "palm 1000"   --run-dir outputs/sharpa/left/cupmove_palmside_scale1/0 --label "palm 1"

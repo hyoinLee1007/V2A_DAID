@@ -14,3 +14,9 @@ retargeting/physics_verification/
 *.swp
 *.backup
 projection_stats.csv
+
+# 데이터 묶음과 실험 중 생긴 임시 산출물.
+reconstruction/dataset.zip
+reconstruction/outputs/
+reconstruction/heatmap_metalcupmove_side_out/
+*.exp_backup

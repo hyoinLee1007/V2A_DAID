@@ -125,11 +125,17 @@ class Config:
     warmup_backoff_trigger_dist: float = 0.0  # only apply the analytical backoff when the robot hand comes within this distance (meters) of the object at the reference pose; 0 = no gate (always apply). See warmup_backoff_gate.py
     # Seconds over which the warmup wrist back-off is faded out AFTER warmup,
     # instead of being dropped at the boundary. Measured on cupmove without it:
-    # the reference wrist jumps 191.4 mm in one step at the warmup boundary,
+    # the reference wrist jumps 191.4 mpdp m in one step at the warmup boundary,
     # the hand (1.6 mm/step) ends warmup 152 mm behind, and the grasp happens
     # during the catch-up with the wrist centimetres off. 0 = old behaviour.
     warmup_offset_decay_duration: float = 0.0
     warmup_offset_decay_steps: int = 0  # derived from warmup_offset_decay_duration / sim_dt
+    # Whether the start pedestal is placed even when the hand already holds the
+    # object at frame 0. True (default) = always when warmup_min_clearance > 0,
+    # since warmup backs the hand off. False = trust the hand-object distance
+    # check. Measured on drawer_dishwasher: the forced pedestal sits in the
+    # hand's approach path and the hand rests on it for 20-40% of steps.
+    force_pedestal_start: bool = True
     warmup_backoff_mode: str = "centroid"  # "centroid" = push hand along object->hand centroid direction; "heatmap" = push along object->handle direction from contact_heatmap_path (see warmup_backoff_direction.py), falling back to centroid on failure
 
     # === OPTIMIZER CONFIGURATION ===
@@ -678,15 +684,40 @@ def process_config(config: Config):
     config.output_dir = processed_dir_robot
     os.makedirs(config.output_dir, exist_ok=True)
 
-    task_info_path = f"{processed_dir_robot}/../task_info.json"
-    try:
-        with open(task_info_path, encoding="utf-8") as f:
-            task_info = json.load(f)
-    except FileNotFoundError:
+    # process_dataset.py writes task_info.json under the *mano* tree, and
+    # generate_scene.py, decompose_mesh.py and resolve_pedestal.py all read it
+    # there — that copy is the canonical one, and the only one the current
+    # pipeline writes. This read looked under the robot's tree instead, where
+    # the files left over from an older layout are never refreshed: on the 12
+    # tasks that have one, a task_info written today (with ref_dt in it) would
+    # have lost to a stale copy from August. Read the canonical one first and
+    # keep the robot-side path as a fallback for runs that predate this.
+    processed_dir_mano = get_processed_data_dir(
+        output_root_dir=output_root_dir_abs,
+        dataset_name=config.dataset_name,
+        robot_type="mano",
+        embodiment_type=config.embodiment_type,
+        task=config.task,
+        data_id=config.data_id,
+    )
+    task_info_candidates = [
+        f"{processed_dir_mano}/../task_info.json",
+        f"{processed_dir_robot}/../task_info.json",
+    ]
+    task_info, task_info_path = {}, None
+    for cand in task_info_candidates:
+        try:
+            with open(cand, encoding="utf-8") as f:
+                task_info = json.load(f)
+            task_info_path = cand
+            break
+        except FileNotFoundError:
+            continue
+    if task_info_path is None:
         loguru.logger.warning(
-            f"task_info.json not found at {task_info_path}, using default values"
+            "task_info.json not found at any of {}, using default values",
+            task_info_candidates,
         )
-        task_info = {}
     if "ref_dt" in task_info:
         config.ref_dt = task_info["ref_dt"]
         loguru.logger.info(f"overriding ref_dt: {config.ref_dt} from task_info.json")

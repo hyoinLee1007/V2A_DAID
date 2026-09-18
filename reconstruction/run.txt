@@ -3,16 +3,6 @@
 -------------------------------------------------------------------------------------------------
 {RECONSTRUCTION}
 
-1.reconstruction 하위 폴더를 만들어서 .mp4 파일 넣음
-
-2-1.영상의 프레임 수 확인
-ffprobe -v error \
-  -select_streams v:0 \
-  -count_packets \
-  -show_entries stream=nb_read_packets \
-  -of csv=p=0 \
-  my_task/my_video.mp4
-
 2-2.영상을 프레임별로 변환 (영상이 있는 디렉토리에서)
 mkdir -p check_frames
 ffmpeg -i putcup_input.mp4 check_frames/frame_%06d.png
@@ -24,6 +14,18 @@ ex) ./run_pipeline.sh dataset/whisking/whisking.mp4 125 whisk right
 
 cf) 영상의 기준 프레임은 '물체가 심하게 가려지지않고,
 물체 전체 형상이 잘 보이는 Frame 선택
+
+**Post-processing**
+cd ~/do-as-i-do/reconstruction/scripts
+python task.py <task> paths                    # 경로가 제대로 잡혔는지
+python task.py <task> optimize                 # layout_camera_frame_optimized.json 생성
+python task.py <task> smooth                   # 물체 자세가 떨릴 때만
+python task.py <task> viz   
+
+*Hand에 대한 segmentation이 진행되지 않은 경우*
+cd ~/do-as-i-do/reconstruction
+python repair_hand_nan.py dataset/<task>/<task>/all_hand_meshes.npz --report   # 먼저 확인
+python repair_hand_nan.py dataset/<task>/<task>/all_hand_meshes.npz            # 필요하면 수정
 
 4. reconstruction 결과를 Visualize 하는 명령어
 cd ~/do-as-i-do/reconstruction/scripts
@@ -59,7 +61,7 @@ python smooth_trajectory.py \
   
  
 <Visualize>
-LAYOUT=/home/intern/do-as-i-do/reconstruction/dataset/appleinput/obj_tracking_out/apple/combined_visualization/layout_camera_frame_optimized_smooth.json
+LAYOUT=/home/intern/do-as-i-do/reconstruction/dataset/metalcupmove/obj_tracking_out/metalcup/combined_visualization/layout_camera_frame_optimized_smooth.json
 
 MESH_SCALE=$(python -c "
 import json
@@ -71,12 +73,12 @@ echo "$MESH_SCALE"
 
 
 python visualize_3d.py \
-  --frames-dir /home/intern/do-as-i-do/reconstruction/dataset/appleinput/all_frames \
-  --layout-json /home/intern/do-as-i-do/reconstruction/dataset/appleinput/obj_tracking_out/apple/combined_visualization/layout_camera_frame_optimized_smooth.json \
-  --mesh /home/intern/do-as-i-do/reconstruction/dataset/appleinput/video_segmentation/masks/frame_000046_masks/cup/cup.obj \
+  --frames-dir /home/intern/do-as-i-do/reconstruction/dataset/metalcupmove/all_frames \
+  --layout-json /home/intern/do-as-i-do/reconstruction/dataset/metalcupmove/obj_tracking_out/metalcup/combined_visualization/layout_camera_frame_optimized_smooth.json \
+  --mesh /home/intern/do-as-i-do/reconstruction/dataset/metalcupmove/video_segmentation/masks/frame_000001_masks/metalcup/metalcup.obj \
   --scale "$MESH_SCALE" \
   --translation-scale 1.0 \
-  --hand-meshes /home/intern/do-as-i-do/reconstruction/dataset/cupmove/cupmove/all_hand_meshes.npz \
+  --hand-meshes /home/intern/do-as-i-do/reconstruction/dataset/metalcupmove/metalcupmove/all_hand_meshes.npz \
   --port 8080
   
 <손이 인식되지않은 경우,별도로 손 mask 생성 &  optimize.json생성> 

@@ -106,11 +106,21 @@ cd "$SCRIPTS_DIR"
 echo "=== Running SAM3 video segmentation (objects, click-based) ==="
 for OBJ_NAME in "${OBJECT_NAMES[@]}"; do
     OBJ_ID="${OBJ_NAME// /_}"
-    DISPLAY="$SAM3_DISPLAY" python run_sam3_video.py \
-        --video "$VIDEO_PATH" \
-        --click \
-        --obj_id "$OBJ_ID" \
-        --frame_idx "$n"
+    if [[ -n "$OBJ_POINTS" ]]; then
+        # 클릭 없이 실행: OBJ_POINTS="x,y" (기준 프레임 픽셀 좌표, 여러 점은 ';')
+        python run_sam3_video.py \
+            --video "$VIDEO_PATH" \
+            --points "$OBJ_POINTS" \
+            --point_labels "${OBJ_POINT_LABELS:-1}" \
+            --obj_id "$OBJ_ID" \
+            --frame_idx "$n"
+    else
+        DISPLAY="$SAM3_DISPLAY" python run_sam3_video.py \
+            --video "$VIDEO_PATH" \
+            --click \
+            --obj_id "$OBJ_ID" \
+            --frame_idx "$n"
+    fi
 done
 
 # SAM3 hand segmentation 부분 수정

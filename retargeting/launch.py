@@ -47,6 +47,11 @@ class PipelineConfig:
     # assumption (the hand gets backed off in a bad direction and the grasp
     # collapses onto the object body — see cupmove).
     start_idx: int = 0
+    # Exclusive end frame for the same trim; 0 keeps everything after start_idx.
+    # HaWoR can leave NaN vertices at either end of a clip (metalcupmove: frames
+    # 0-14, 23-27 and 289-299), and a NaN reaching the pipeline surfaces as
+    # "SVD did not converge" rather than anything that names the real cause.
+    end_idx: int = 0
     dataset_name: str = "do_as_i_do"
     # Ray-depth correction for the raw hand track, applied in process_dataset
     # before the reference is built. See utils/ray_depth_correction.py. Empty
@@ -121,7 +126,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
     # (solve_ik's reference AND optimize_physics' in-hand gate masks) sees the
     # same shifted timeline. Trimming only the IK via solve_ik(start_idx=...)
     # would desynchronize the gates, so the data itself is cut here.
-    if cfg.start_idx > 0:
+    if cfg.start_idx > 0 or cfg.end_idx > 0:
         from retargeting.utils.io import get_processed_data_dir, resolve_auto_embodiment
 
         emb = cfg.hand_type
@@ -141,14 +146,16 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         else:
             wl, wr = data["qpos_wrist_left"], data["qpos_wrist_right"]
             n_frames = wl.shape[0] if wl.size else wr.shape[0]
+            stop = cfg.end_idx if cfg.end_idx > 0 else n_frames
             for k, a in data.items():
                 if a.ndim >= 1 and a.shape[0] == n_frames:
-                    data[k] = a[cfg.start_idx:]
+                    data[k] = a[cfg.start_idx:stop]
             data["trim_start_idx"] = np.array(cfg.start_idx)
+            data["trim_end_idx"] = np.array(stop)
             np.savez(mano_npz, **data)
             loguru.logger.info(
-                "Trimmed first {} frames from {} ({} -> {} frames).",
-                cfg.start_idx, mano_npz, n_frames, n_frames - cfg.start_idx,
+                "Trimmed {} to frames [{}, {}) ({} -> {} frames).",
+                mano_npz, cfg.start_idx, stop, n_frames, stop - cfg.start_idx,
             )
 
     # Stage 2: convex decomposition
@@ -220,7 +227,8 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         use_support=USE_SUPPORT,
         hand_object_distance_thresh=config.hand_object_distance_thresh,
         force=cfg.force,
-        force_pedestal_start=config.warmup_min_clearance > 0.0,
+        force_pedestal_start=(config.force_pedestal_start
+                              and config.warmup_min_clearance > 0.0),
     )
 
     # Stage 5: physics optimization (MuJoCo Warp)
